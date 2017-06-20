@@ -1,0 +1,352 @@
+#!/usr/local/bin/perl5 -wT
+
+use strict;
+
+BEGIN {
+    $ENV{ PATH } = '/usr/local/bin:/usr/bin:/bin';
+
+}
+
+use lib '/usr/local/admin/lib';
+
+use Expect;
+use Fcntl qw( LOCK_EX );
+use Getopt::Long;
+use IO::Handle;
+use IPC::Open3;
+use Pod::Usage;
+use Term::ReadKey;
+use POSIX;
+
+use EmplOrg::AccountDB;
+
+# Constants
+my $DEFAULT_SHELL = '/bin/csh';
+my $LOCK_FILE     = '/var/newacct/lock';
+my $PASSWD  	  = '/usr/bin/passwd';
+#my $LINK_BASE 	  = '/users';
+my $SHELLS_FILE   = '/etc/shells';
+my $PW_PROG       = '/usr/sbin/pw';
+my $SUDO          = '/usr/local/bin/sudo';
+my $WEBIT         = '/usr/local/bin/webit';
+my $SETFACL       = '/bin/setfacl';
+my $WWW_GRP       = 'www';
+#    NOT CURRENTLY USED
+# my $USERADD     = '/usr/sbin/pw useradd';
+# my $GROUPADD    = '/usr/sbin/pw groupadd';
+my $EDQUOTA     = '/usr/sbin/edquota';
+my $QUOTA_USER  = 'mig_jc';
+# my $POPME       = '/usr/local/bin/popme';
+
+# Globals
+my $Verbose = 0;
+
+######################################################################
+sub run {
+    my( @args ) = @_;
+
+    my $wtrfh = new IO::Handle;
+    my $rdrfh = new IO::Handle;
+    my $errfh = new IO::Handle;
+
+    print "Running: @args\n" if( $Verbose >= 2 );
+    my $pid = open3( $wtrfh, $rdrfh, $errfh, @args )
+        or die "Can't run @args: $!";
+    waitpid( $pid, 0 );
+    return( join( '', $rdrfh->getlines, $errfh->getlines ) );
+}
+######################################################################
+# MAIN
+######################################################################
+
+# Process options
+my %options = ();
+GetOptions( \%options,
+            "help",
+            "man",
+            "verbose:+",
+
+            "account=s",
+            "fullname=s",
+            "pgp=s",
+            "pop!",
+            "realname=s",
+            "shell=s",
+            "sponsor=s",
+            "alternate=s",
+            "telephone=s",
+          ) or pod2usage( 2 );
+
+# Check help parameters
+pod2usage(1) if $options{ help };
+pod2usage(-exitstatus => 0, -verbose => 2) if $options{ man };
+
+# Check no extra parameters
+pod2usage(1) if( @ARGV );
+
+# Unload paramters
+$Verbose    = $options{ verbose } || 0;
+my $account = $options{ account };
+
+# Check account
+pod2usage(1) unless( $account );
+$account =~ /^(\w{1,16})$/;
+$account = $1 or die "Bad account.\n";
+
+# Make sure account doesn't already exist
+die "Account already exists" if getpwnam( $options{ account } );
+# Since group is based on account, make sure no collisions there, either
+die "Account group name already exists" if getgrnam( $options{ account } );
+
+# Get password
+my $password;
+if( -t STDIN && -t STDOUT ) {   # We're interactive
+    print "Password: ";
+    ReadMode( 'noecho' );
+    $password = ReadLine( 0 );
+    ReadMode( 'restore' );
+    print "\n";
+}
+else {
+    $password = <STDIN>;
+}
+
+# Check fullname. No colons, ampersands or newlines
+if( $options{ fullname } ) {
+    $options{ fullname } =~ /^([^\n\r:&]*)$/;
+    $options{ fullname } = $1 or die "Bad fullname.\n";
+}
+else {
+    $options{ fullname } = $account;
+}
+
+# Check pgp. It can be pretty much anything and is optional. We'll
+# just stick it in the database.
+$options{ pgp } ||= '';
+
+# Check pop. There's nothing to check. It's either set or not.
+
+# Check real name. It has to be set. It can be pretty much anything.
+# We'll just stick in the database.
+pod2usage( 2 ) unless $options{ realname };
+
+# Make sure shell is in /etc/shells
+if( $options{ shell } ) {
+    open( SHELLS, $SHELLS_FILE ) or die "Can't open $SHELLS_FILE: $!\n";
+    my @shells = <SHELLS>;
+    close SHELLS or die "Can't read $SHELLS_FILE: $!\n";
+    chomp( @shells );
+    die "Bad shell.\n" unless grep { $_ eq $options{ shell } } @shells;
+    # Detaint; we looked it up in a root-only file.
+    $options{ shell } =~ /^(.*)$/;
+    $options{ shell } = $1;
+}
+else {
+    $options{ shell } = $DEFAULT_SHELL;
+}
+
+# Check sponsor. If it exists, it needs to be an email address
+if( $options{ sponsor } ) {
+    $options{ sponsor } =~ /^([\w.]+\@[\w.]+)$/;
+    $options{ sponsor } = $1 or die "Bad sponsor.\n";
+}
+
+# Check alternate. If it exists, it needs to be an email address
+if( $options{ alternate } ) {
+    $options{ alternate } =~ /^([\w.]+\@[\w.]+)$/;
+    $options{ alternate } = $1 or die "Bad alternate E-mail address.\n";
+}
+else {
+    $options{ alternate } = '';
+}
+
+# Check telephone. It's optional and can be anything.
+$options{ telephone } ||= '';
+
+# Creation lock. Only one of these should run at a time.
+open( LOCK, ">$LOCK_FILE" )
+    or die "Couldn't open lock( $LOCK_FILE ): $!";
+flock( LOCK, LOCK_EX ) or die "Couldn't get lock: $!";
+
+######################################################################
+# BEGIN CREATION HERE
+######################################################################
+
+my $result;
+
+# Fix up UID so things like groupadd will work.
+$< = $>;
+
+#
+# Create account with REAL home directory (i.e. "/export/homeaf/joeuser")
+# On FreeBSD, make sure you use the "/etc/pw.conf" we've configured explicitly
+# for this script.  It sets some values that cannot be given from the
+# command line, like reuseduid and reusegid.
+#
+print "Creating account $account\n" if $Verbose;
+my @useradd_options = ( 'useradd',
+			$account,
+			'-m',
+                        '-s', $options{ shell },
+                      );
+
+push @useradd_options, '-c', $options{ fullname }
+    if exists( $options{ fullname } );
+
+$result = run( $PW_PROG, @useradd_options);
+if( $? ) { die "Unable to create user ($account): rc=$?\n$result\n" };
+
+# Set password
+print "Setting password.\n" if $Verbose;
+my $exp = Expect->spawn( $PASSWD, $account )
+    or die "Cannot spawn passwd: $!\n";;
+
+$result = 0;
+$exp->log_stdout(0);
+$exp->expect(5,
+             [
+              'assword:' => sub { my $exp = shift;
+                                    $exp->send( $password, "\n" );
+                                    exp_continue;
+                                }
+	      ]);
+
+#             [
+#              'passwd: done' => sub { $result = 1 },
+#             ]
+#            );
+
+$exp->soft_close();
+# die "Unable to set password.\n" unless $result;
+
+
+# Set quota
+print "Setting quota.\n" if $Verbose;
+$result = run( $EDQUOTA, '-p', $QUOTA_USER, $account );
+if( $? ) { die $result };
+
+# Link the home directory into the "master" directory unless we
+# just created the home directory in that directory anyway.
+# JCLARKE: We do not need to do this on banjo.
+#print "Linking homedir.\n" if $Verbose;
+#my $link_homedir = join( '/', $LINK_BASE, $account );
+#print "   $link_homedir -> $homedir\n" if $Verbose >= 2;
+#if ( $link_homedir ne $homedir ) {
+#    symlink($homedir, $link_homedir ) or die "Couldn't link homedir: $!";
+#    POSIX::lchown( scalar getpwnam( $account ), 
+#		   scalar getgrnam( $account ), "$link_homedir" );
+#}
+
+
+# Now reset the /etc/passwd homedir reference to use the link name and
+# not the space storage name
+#my @usermod_options = ( 'usermod',
+#			$account,
+#			'-d', $link_homedir 
+#		      );
+#$result = run( $PW_PROG, @usermod_options);
+#if( $? ) { die "Unable to change home directory for user ($account): rc=$?\n$result\n" };
+my $homedir = ( getpwnam( $account) )[7];
+chmod( 0700, $homedir );
+
+# Create WWW directory
+mkdir( "$homedir/WWW", 0700 );
+chown( scalar getpwnam( $account ),
+       scalar getgrnam( $account ), "$homedir/WWW" );
+system( "$SUDO -u $account $WEBIT -a -q" );
+
+# Use POSIX ACLs to allow www to access the home directory and WWW
+# sub-directory.
+#system( "$SETFACL -m g:$WWW_GRP:rx,u::rwx,g::---,o::--- $homedir $homedir/WWW" );
+
+# Log it
+print "Updating database.\n" if $Verbose;
+my $db = new EmplOrg::AccountDB;
+
+$db->insert( account   => $account,
+             sponsor   => $options{ sponsor   },
+             realname  => $options{ realname  },
+             telephone => $options{ telephone },
+             pgp       => $options{ pgp       },
+             alternate => $options{ alternate },
+           );
+
+
+
+# Unlock
+close LOCK;
+
+__END__
+
+=head1 NAME
+
+makeuser - Creates a new user for employees.org
+
+=head1 SYNOPSIS
+
+B<makeuser> S< B<-help> > |
+            S< B<-man> > |
+            S< B<-account> I<userid> >
+            S< B<-sponsor> I<sponsor@example.org> >
+            S< B<-alternate> I<alternate@other-example.org> >
+            S< B<-realname> I<real_name> >
+            S<[B<-shell> I<shell>]>
+            S<[B<-telephone> I<telephone>]>
+            S<[B<-fullname> I<full_name>]>
+            S<[B<-pgp> I<pgp_key>]>
+            S<[B<-pop>]>
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<-help>
+
+Print a brief help message and exits.
+
+=item B<-man>
+
+Prints the manual page and exits.
+
+=item B<-account>
+
+Userid to be created
+
+=item B<-sponsor>
+
+Email address of account sponsor
+
+=item B<-alternate>
+
+Alternate Email address to contact owner of account
+
+=item B<-fullname>
+
+GCOS field for account
+
+=item B<-pgp>
+
+PGP public key for account
+
+=item B<-pop>
+
+Run B<popme> for this account.
+
+=item B<-realname>
+
+Real name for account. This is only stored in the database, not the
+GCOS field.
+
+=item B<-shell>
+
+Shell for account. Must be a valid shell from /etc/shells.
+
+=item B<-telephone>
+
+Contact number for account
+
+=back
+
+=head1 DESCRIPTION
+
+=cut

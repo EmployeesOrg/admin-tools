@@ -1,0 +1,85 @@
+#!/usr/local/bin/perl5 -wT
+
+use strict;
+
+BEGIN {
+    $ENV{ PATH } = '/usr/local/bin:/usr/bin:/bin';
+
+}
+
+use lib '/usr/local/admin/lib';
+
+use Expect;
+use Fcntl qw( LOCK_EX );
+use Getopt::Long;
+use IO::Handle;
+use IPC::Open3;
+use Pod::Usage;
+use Term::ReadKey;
+use POSIX;
+
+# Constants
+# my $LOCK_FILE     = '/var/resetpw/lock';
+my $PASSWD  	  = '/usr/bin/passwd';
+
+# Globals
+
+######################################################################
+# MAIN
+######################################################################
+
+# Process options
+my %options = ();
+GetOptions( \%options,
+            "account=s",
+          );
+
+my $account = $options{ account };
+
+# Check account
+$account =~ /^(\w{1,16})$/;
+$account = $1 or die "Bad account.\n";
+
+# Make sure account exists
+die "Account does not exist" if ! getpwnam( $options{ account } );
+
+# Get password
+my $password;
+$password = <STDIN>;
+
+
+######################################################################
+# BEGIN RESET HERE
+######################################################################
+
+my $result;
+
+# Fix up UID so things like groupadd will work.
+$< = $>;
+
+# Set password
+my $exp = Expect->spawn( $PASSWD, $account )
+    or die "Cannot spawn passwd: $!\n";;
+
+$result = 0;
+$exp->log_stdout(0);
+$exp->expect(5,
+             [
+              'assword:' => sub { my $exp = shift;
+                                    $exp->send( $password, "\n" );
+                                    exp_continue;
+                                }
+	      ]);
+
+#             [
+#              'passwd: done' => sub { $result = 1 },
+#             ]
+#            );
+
+$exp->soft_close();
+#die "Unable to set password.\n" unless $result;
+
+__END__
+
+=head1 NAME
+

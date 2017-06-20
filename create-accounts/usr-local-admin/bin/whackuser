@@ -1,0 +1,293 @@
+#!/usr/local/bin/perl5 -w
+
+#####################################################################
+# whackuser
+# Clay Luther & Rob Napier
+# claycle@employees.org & rnapier@employees.org
+#####################################################################
+
+use strict;
+use lib qw( /usr/local/admin/lib );
+use EmplOrg::AccountDB;
+use Fcntl qw( :flock );
+
+my $USAGE = "USAGE: whackuser <userid> [<userid> [...]]";
+
+my $DESCRIPTION =
+'Whackuser removes a user from the active user list of employees.org.
+The user\'s files are searched for and removed to an archive
+directory where they rest for a time before deletion.
+';
+
+my $VERSION = "2.00";
+
+#####################################################################
+# Globals
+#####################################################################
+
+my $DEBUG = 1;             # Debugging level, 0, 1, or 2
+
+my $WHACKDIR = "/var/whackuser";
+my $DEADDIR = "$WHACKDIR/whacked";
+my $TMPDIR = "/tmp";
+my $MAILDIR = "/var/mail";
+my $FTPDIR = "/ftp";
+my $USERSYMDIR = "/users";
+
+my $LOGFILE = "$WHACKDIR/whackuser.log";
+my $LOCKFILE = "$WHACKDIR/whackuser.lock";
+
+my $USERDB = new EmplOrg::AccountDB;
+
+my $Userid;
+
+sub debug
+{
+        print "DEBUG: @_\n" if $DEBUG;
+}
+
+sub llog
+{
+        my($str) =  @_;
+        my $date = localtime();
+        print LOGFILE $date, ": (", $Userid, ") ", $str, "\n";
+        debug($str);
+}
+
+sub error
+{
+	my( $str ) = @_;
+	my( $err ) = "ERROR: $str";
+	warn $err, "\n";
+	llog( $err );
+}
+
+sub lockMe
+{
+	open( LOCK, ">$LOCKFILE" ) or die "Can't aquire lock: $!";
+	flock( LOCK, LOCK_EX ) or die "whackuser is currently running.\n";
+}
+
+sub isUser
+{
+	my( $user ) = @_;
+	return getpwnam( $user );
+}
+
+sub run
+{
+	my( $cmd ) = @_;
+
+	llog( $cmd );
+	system( "$cmd" ) == 0 or do {
+		error( "Couldn't $cmd : $?" );
+		return undef;
+	};
+	return 1;
+}
+
+sub makeDeadDir
+{
+	my( $name ) = @_;
+
+	my $dir = "$DEADDIR/$Userid/$name";
+	mkdir( $dir, 0700 ) or do {
+		error( "Can't create $dir: $!" );
+		return undef;
+	};
+	return $dir;
+}
+
+sub grabInfo
+{
+	my( $userid ) = @_;
+
+	my $infoDir = makeDeadDir( "info" );
+	my @infoFiles = qw( /etc/passwd /etc/master.passwd /etc/group );
+	run( "grep \\^$userid: @infoFiles > $infoDir/userinfo" )
+		or return undef;
+	return 1;
+}
+
+sub grabMail
+{
+	my( $userid ) = @_;
+
+	my $deadmail = makeDeadDir( "mail" );
+	my $usermail = "$MAILDIR/$userid";
+
+	debug( "Find $usermail...");
+	if( -e $usermail )
+	{
+		debug("$usermail exists. Copying file.");
+		run( "cp -p $usermail $deadmail" ) or return undef;
+	}
+	return 1;
+}
+
+sub grabFtp
+{
+	my( $userid ) = @_;
+
+	my $deadftp = makeDeadDir( "ftp" );
+
+	my $userftp = "$FTPDIR/$userid";
+        debug("Find $userftp...");
+        if (-d $userftp)
+        {
+        	debug("$userftp exists. Copying directory.");
+		chdir $userftp or die "Can't chdir to $userftp: $!";
+                run( "find . | cpio -pdum $deadftp" ) or return undef;
+	}
+	return 1;
+}
+
+sub grabHome
+{
+	my( $userid ) = @_;
+
+	my $deadhome = makeDeadDir( "home" );
+
+	my $userhome = (getpwnam( $userid ) )[7];
+	# Chase symlinks (careful, they can loop)
+	for( 1..5 ) {
+		last unless( -l $userhome );
+		$userhome = readlink( $userhome );
+	}
+	if( -l $userhome ) {
+		error( "Too many links in $userhome." );
+		return undef;
+	}
+
+	chdir( $userhome ) or die "Can't chdir to $userhome: $!";
+	run( "find . | cpio -pdum $deadhome" ) or return undef;
+
+	return 1;	
+}
+
+sub makeTar
+{
+	my( $userid ) = @_;
+
+	chdir( $DEADDIR );
+	run( "tar cfz $userid.tar.gz $userid" ) or return undef;
+
+	run( "rm -rf $userid" ) or return undef;
+
+	return 1;
+}
+
+sub rmHome
+{
+	my( $userid ) = @_;
+
+	my $userhome = (getpwnam( $userid ) )[7];
+	my $uid = getpwnam( $userid );
+	my $homediruid = 0;
+
+	# Chase symlinks (careful, they can loop)
+	for( 1..5 ) {
+		last unless( -l $userhome );
+		$userhome = readlink( $userhome );
+	}
+	if( -l $userhome ) {
+		error( "rmHome: Too many links in $userhome." );
+		return undef;
+	}
+	if (!(-d $userhome)) {
+		error( "rmHome: $userhome is not a directory!" );
+		return undef;
+	}
+	# Is it owned by the user
+	$homediruid = (stat( $userhome ))[4];
+	if ( $homediruid != $uid) {
+		error( "rmHome: UID of directory $userhome ($homediruid) != $userid ($uid)" );
+		return undef;
+	}
+
+	# All systems go, nuke it!
+	run( "rm -rf $userhome" ) or return undef;
+
+	return 1;
+}
+
+sub rmUser
+{
+	my( $userid ) = @_;
+
+	return run( "/usr/sbin/pw userdel $userid" );
+}
+
+sub rmLink
+{
+	my( $userid ) = @_;
+	my $symlink = "$USERSYMDIR/$userid";
+	return 1 unless -l $symlink;
+	llog("Unlink-ing: $symlink");
+	return unlink( $symlink );
+}
+
+sub rmGroup
+{
+	my( $userid ) = @_;
+	return run( "/usr/sbin/pw groupdel $userid" );
+}
+
+sub rmFtp
+{
+	my( $userid ) = @_;
+	return run( "rm -rf $FTPDIR/$userid" );
+}
+
+sub rmMail
+{
+	my( $userid ) = @_;
+	return run( "rm -f $MAILDIR/$userid" );
+}
+
+######################################################################
+# MAIN  
+######################################################################
+
+$ENV{ PATH } = "/usr/local/bin:/bin:/usr/bin:/usr/sbin";
+
+debug("Debugging is on.");
+        
+die($USAGE) unless scalar @ARGV;
+
+lockMe();              
+
+debug( "Opening logfile $LOGFILE" );
+open(LOGFILE, ">>$LOGFILE") or die "Can't open $LOGFILE: $!\n";
+
+EACHUSER:
+while( $Userid = shift ) # Since $Userid is global, don't use for() here
+{
+        if (!isUser($Userid)) { 
+		print "$Userid does not exist; skipping.\n";
+		next EACHUSER;
+	 }
+
+        debug("Make a dead directory for $Userid in $DEADDIR");
+	my $userdir = makeDeadDir("") or next EACHUSER;
+
+        llog("Processing: $Userid");
+	grabInfo( $Userid ) or next EACHUSER;
+	grabMail( $Userid ) or next EACHUSER;
+	grabFtp(  $Userid ) or next EACHUSER;
+	grabHome( $Userid ) or next EACHUSER;
+
+	makeTar( $Userid ) or next EACHUSER;
+
+	rmHome(  $Userid );
+	rmUser(  $Userid );
+	rmLink(  $Userid );
+# Not needed - pw userdel in rmUser also nukes the group
+#	rmGroup( $Userid );
+# not needed - we no longer support FTP directories.
+#	rmFtp(   $Userid );
+	rmMail(  $Userid );
+
+	$USERDB->delete( $Userid );
+}
+close LOGFILE;

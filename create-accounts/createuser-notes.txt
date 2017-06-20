@@ -1,0 +1,116 @@
+
+
+  X In account/lib/NewAccount/ - CreateAccount.pm is not used, correct?
+    [ Correct.  It is not use.  The makeuser script does all the work]
+
+  - Installed /usr/ports/lang/p5-Error
+
+  - Installed /usr/ports/mail/p5-Mail-Sendmail
+
+  - Need to eliminate the possiblly confused characters from the Key 
+    string - 'O' vs '0', 'l' vs '1', etc.
+
+  X Need to think through ownerships of directories and who the server run 
+    as.  Did is suEXEC as user "admin"?  It looks like it did, but I need 
+    to figure out how to turn that on at home.
+    [ we run as admin, being run via https://www.employees.org/~admin/ ]
+
+  X We no longer need the popme stuff.  Are there things we'd like to add 
+    at this point?
+
+  X WIERD!  PageCreateAccount.pm emits it's page but fails to execute 
+    anything after the call to send_bottom(); when send_bottom() does a 
+    close STDOUT.  If I comment out the close, the module executes 
+    successfully.  If I move send_bottom() to the end of run() (so the
+    close STDOUT is the last thing done), it runs OK.  But if I leave 
+    things as it is it silently fails.  No mail to sponsor ("otherwise" 
+    clause), no unlink of the token file.  Nothing in any of the log 
+    files.  Nothing.  It seems like the CGI process is killed when it
+    the running program closes stdout.
+
+    For now, I've moved the send_bottom() to the end of run().
+    [Apache v1.3.x vs v2.x - works fine in Apache v2.x - K^2]
+  
+
+  - installed /usr/ports/lang/p5-Expect, which dragged a lot of 
+    p5-Tty/Stty stuff with it.
+
+  - We need to port webit to fix directory group ownership and permissions.
+    x Where are the sources?  
+      [On TOS in /usr/local/src/webit/]
+    x do port
+      [Port requires /usr/lib/perl5.005 to work - 5.8.4 works, but pod2usage() 
+       fails on writing man pages]
+
+  - Installed Term::ReadKey  for makeuser script.
+
+  - Adding a new Column to accounts database (for Last Accessed)
+    We want to change the "created" from a TIMESTAMP to a DATETIME field,  
+    add a "record_updated" timestamp in front of created, and add a 
+    "last_accessed" to keep track of when the account was last accessed 
+    (NOT THE RECORD!).  This will take a few steps.
+
+    Make a backup dump with:
+
+    mysqldump admin -u admin -p > admin.dump
+
+    After backup.
+
+    mysql
+    use admin;    # admin is the database
+    # Create our new columns
+    alter table accounts add column last_accessed datetime;
+    alter table accounts add column created_safety datetime;
+    alter table accounts add column alternate_contact varchar(50) default NULL after pgp;
+    alter table accounts add column record_updated timestamp after alternate_contact;
+    
+    # Now we do the update.  note well the "created = created".  That keeps it
+    # from changing during this update!
+
+    update accounts set created_safety = created, created = created, record_updated = NOW(), last_accessed = NOW();
+
+    # Now change the created column from a timestamp to a datetime
+    alter table accounts drop column created;
+    alter table accounts add column created datetime;
+    update accounts set created = created_safety;
+
+    # Now clean up our temp column
+    alter table accounts drop column created_safety;
+
+
+    # Now add a last_accessed to accounts_deleted table
+    alter table accounts_deleted add column last_accessed datetime;
+    alter table accounts_deleted add column alternate_contact varchar(50) default NULL after pgp;
+
+
+  - Stuff is spread out all over the place.
+    /users/admin/SWWW/newacct.cgi 
+    /users/admin/newacct/lib/NewAcct/ - for the .pm used by newacct.cgi
+    /var/newacct/error_log      - Log of newacct.cgi
+    /var/newacct/tokens         - token holding for account creation.
+
+    /var/newacct/config         - used by AccountDB.pm, which is used by 
+    /usr/local/admin/makeuser   - suid perl script to make users.
+    /usr/local/admin/EmlpOrg/   - .pm used by makeuser to access the MySQL database.
+
+    /usr/local/bin/webit        - SUID wrapper around perl script to set group
+                                  and permissions for web access.
+    /usr/local/libexec/webit.pl - The script itself.
+
+
+    All perl modules go under /usr/local/admin/lib/, EmplOrg and NewAcct
+
+    /var/newacct need to be chown admin:staff
+
+    The makeuser needs a C suid wrapper to get the effective UID of root.
+    Install that bin in /usr/local/admin/bin/, put the makeuser.pl in
+    /usr/local/admin/libexec/.  Crank the permissions down hard!
+
+    The newacct.cgi has to go into /users/admin so it will suexec as "admin"
+    and then be able to run the /usr/local/admin/bin/makeuser script to actually
+    create the account.
+
+    - Need to update text referring to the FAQ.  Currently says ~admin/
+      Find out new location and update.
+
+
