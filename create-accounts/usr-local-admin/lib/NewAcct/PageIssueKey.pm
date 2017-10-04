@@ -37,14 +37,12 @@ sub send_page {
     my( $key, $token ) = generate_key_token();
 
     print<<EOF;
-<p>We have mailed a URL including a token to your existing account.
-When you receive that message, if you are not the user of the account,
-forward the message to the user. The user should then follow the link,
-and enter the following key. This will demonstrate that the sponsor
-account is legal and that it is yours.</p>
-
-<h1 align=center>Key (Keep This For Later!)</h1>
-<h2 align=center>$key</h2>
+<p>We have mailed a URL including a token to your Sponsor account.</p>          
+<p>When your sponsor receives that message, forward it to the new               
+user.  The new user should then follow the link from that email,                
+and enter the following key.</p>                                                
+                                                                                
+<h1>Key: $key</h1>
 EOF
 
     # And mail the user
@@ -63,10 +61,6 @@ employees.org by any member of a sponsorship group may lead to
 the termination of all the accounts. Also remember that all
 sponsored accounts together may only use 250M.
 
-Note to Elm users:  Elm performs URL escaping improperly and
-mangles the URL.  You will need to remove the "3D" from between
-the "token=" and the 8 character token itself in the URL.
-              
 $url
 EOF
 
